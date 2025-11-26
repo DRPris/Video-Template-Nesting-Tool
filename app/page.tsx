@@ -23,6 +23,29 @@ interface ParsedErrorResponse {
   payload: unknown
 }
 
+interface BlobUploadUrlResponse {
+  uploadUrl: string
+  blobId: string
+  publicUrl: string
+  expiresAt?: string
+}
+
+interface RemoteFileReferencePayload {
+  url: string
+  originalName: string
+  size: number
+  mimeType: string
+}
+
+interface ProcessRequestBody {
+  videos: RemoteFileReferencePayload[]
+  templates: {
+    vertical?: RemoteFileReferencePayload
+    square?: RemoteFileReferencePayload
+    landscape?: RemoteFileReferencePayload
+  }
+}
+
 type JobStatus = "pending" | "processing" | "completed" | "failed"
 
 interface JobStatusResponse {
@@ -113,6 +136,98 @@ async function parseErrorResponse(response: Response): Promise<ParsedErrorRespon
   }
 
   return { message: statusLabel, payload: null }
+}
+
+const MAX_SINGLE_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2GB
+
+/**
+ * 将字节数转换为可读字符串，便于错误提示。
+ */
+function formatBytesForDisplay(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ["KB", "MB", "GB", "TB"]
+  let value = bytes
+  let unitIndex = -1
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(2)} ${units[unitIndex] ?? "KB"}`
+}
+
+/**
+ * 请求后端生成一次性 Blob 上传 URL。
+ */
+async function requestBlobUploadUrl(file: File): Promise<BlobUploadUrlResponse> {
+  const response = await fetch("/api/blob-upload-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type || "application/octet-stream",
+      fileSize: file.size,
+    }),
+  })
+
+  if (!response.ok) {
+    const { message } = await parseErrorResponse(response)
+    throw new Error(message)
+  }
+
+  return (await response.json()) as BlobUploadUrlResponse
+}
+
+/**
+ * 使用 XMLHttpRequest 上传文件，以便追踪进度事件。
+ */
+function uploadBinaryWithProgress(uploadUrl: string, file: File, onProgress?: (ratio: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open("PUT", uploadUrl)
+    if (file.type) {
+      xhr.setRequestHeader("Content-Type", file.type)
+    }
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && onProgress) {
+        onProgress(event.loaded / event.total)
+      }
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve()
+      } else {
+        reject(new Error(`上传失败（状态码 ${xhr.status}）`))
+      }
+    }
+
+    xhr.onerror = () => reject(new Error("网络异常导致上传失败"))
+    xhr.send(file)
+  })
+}
+
+/**
+ * 将单个文件上传到 Blob 并返回可供后端使用的引用。
+ */
+async function persistFileViaBlob(
+  file: File,
+  label: string,
+  onProgress?: (ratio: number) => void,
+): Promise<RemoteFileReferencePayload> {
+  if (file.size > MAX_SINGLE_UPLOAD_BYTES) {
+    throw new Error(`${label} 超过当前 ${formatBytesForDisplay(MAX_SINGLE_UPLOAD_BYTES)} 的单文件限制`)
+  }
+
+  const uploadTarget = await requestBlobUploadUrl(file)
+  await uploadBinaryWithProgress(uploadTarget.uploadUrl, file, onProgress)
+
+  return {
+    url: uploadTarget.publicUrl,
+    originalName: file.name,
+    size: file.size,
+    mimeType: file.type || "application/octet-stream",
+  }
 }
 
 export default function Home() {
@@ -279,36 +394,48 @@ export default function Home() {
     setQueuePosition(null)
 
     try {
-      // 构建 FormData - 注意字段名称与后端 API 一致
-      const formData = new FormData()
-      
-      // 上传所有竖版视频
-      videos.forEach((video) => {
-        formData.append("video_vertical", video)
-      })
-      
-      // 上传模板文件（根据用户选择）
-      if (templates.vertical) {
-        formData.append("template_vertical", templates.vertical)
-      }
-      if (templates.square) {
-        formData.append("template_square", templates.square)
-      }
-      if (templates.horizontal) {
-        formData.append("template_landscape", templates.horizontal)
-      }
-
-      console.log("========== 开始视频处理 ==========")
+      console.log("========== 开始准备 Blob 上传 ==========")
       console.log(`上传的视频数量: ${videos.length}`)
       console.log("竖版模板:", templates.vertical?.name || "未上传")
       console.log("方版模板:", templates.square?.name || "未上传")
       console.log("横版模板:", templates.horizontal?.name || "未上传")
 
-      // 调用新的 /api/process 端点
-      console.log("正在发送请求到 /api/process...")
+      const uploadedVideos: RemoteFileReferencePayload[] = []
+      for (const [index, video] of videos.entries()) {
+        const uploaded = await persistFileViaBlob(video, `竖版视频 #${index + 1}`)
+        uploadedVideos.push(uploaded)
+      }
+
+      const uploadedTemplates: {
+        vertical?: RemoteFileReferencePayload
+        square?: RemoteFileReferencePayload
+        landscape?: RemoteFileReferencePayload
+      } = {}
+
+      if (templates.vertical) {
+        uploadedTemplates.vertical = await persistFileViaBlob(templates.vertical, "竖版模板")
+      }
+      if (templates.square) {
+        uploadedTemplates.square = await persistFileViaBlob(templates.square, "方版模板")
+      }
+      if (templates.horizontal) {
+        uploadedTemplates.landscape = await persistFileViaBlob(templates.horizontal, "横版模板")
+      }
+
+      const requestPayload: ProcessRequestBody = {
+        videos: uploadedVideos,
+        templates: {
+          ...(uploadedTemplates.vertical ? { vertical: uploadedTemplates.vertical } : {}),
+          ...(uploadedTemplates.square ? { square: uploadedTemplates.square } : {}),
+          ...(uploadedTemplates.landscape ? { landscape: uploadedTemplates.landscape } : {}),
+        },
+      }
+
+      console.log("正在发送 JSON 请求到 /api/process...")
       const response = await fetch("/api/process", {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestPayload),
       })
 
       console.log("收到响应, 状态码:", response.status)

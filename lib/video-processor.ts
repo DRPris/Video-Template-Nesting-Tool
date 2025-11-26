@@ -14,7 +14,6 @@ import fs from 'fs'
 import path from 'path'
 import ffmpeg from 'fluent-ffmpeg'
 import ffmpegStatic from 'ffmpeg-static'
-import { execSync } from 'child_process'
 
 /**
  * 支持的模板类型枚举。
@@ -92,33 +91,27 @@ const OUTPUT_DIRECTORY = '/tmp'
 let ffmpegConfigured = false
 
 /**
- * 确保 FFmpeg 仅初始化一次：优先使用 ffmpeg-static，若不可用则回退到系统 ffmpeg。
+ * 确保 FFmpeg 仅初始化一次：在无系统依赖的 Serverless 环境中，
+ * 强制使用随包发布的 ffmpeg-static 二进制文件。
  */
 function ensureFfmpegIsReady(): void {
   if (ffmpegConfigured) return
 
-  let ffmpegPath = ffmpegStatic
-
-  if (!ffmpegPath || (ffmpegPath && !fs.existsSync(ffmpegPath))) {
-    console.log('⚠️  ffmpeg-static 不可用，尝试使用系统 ffmpeg')
-    try {
-      const systemFfmpeg = execSync('which ffmpeg', { encoding: 'utf8' }).trim()
-      if (systemFfmpeg && fs.existsSync(systemFfmpeg)) {
-        ffmpegPath = systemFfmpeg
-        console.log('✅ 使用系统 ffmpeg:', ffmpegPath)
-      }
-    } catch (error) {
-      console.error('❌ 未找到 ffmpeg，请安装 ffmpeg：brew install ffmpeg')
-    }
+  if (!ffmpegStatic || typeof ffmpegStatic !== 'string') {
+    throw new Error(
+      '未能从 ffmpeg-static 解析到可执行文件，请确认依赖已安装且未被 tree-shaking 移除。',
+    )
   }
 
-  if (ffmpegPath) {
-    ffmpeg.setFfmpegPath(ffmpegPath)
-    ffmpegConfigured = true
-    console.log('🎬 FFmpeg 路径已设置:', ffmpegPath)
-  } else {
-    throw new Error('FFmpeg 未配置成功，无法继续处理视频')
+  if (!fs.existsSync(ffmpegStatic)) {
+    throw new Error(
+      `在路径 ${ffmpegStatic} 未找到 ffmpeg，可尝试重新安装依赖：pnpm add ffmpeg-static`,
+    )
   }
+
+  ffmpeg.setFfmpegPath(ffmpegStatic)
+  ffmpegConfigured = true
+  console.log('🎬 FFmpeg 路径已锁定为静态依赖:', ffmpegStatic)
 }
 
 ensureFfmpegIsReady()
