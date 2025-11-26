@@ -1,0 +1,35 @@
+# macOS and IDE cruft
+.DS_Store
+Thumbs.db
+
+# Dependency directories
+node_modules/
+.pnpm-store/
+.yarn/
+
+# Build and cache artifacts
+.next/
+.turbo/
+dist/
+build/
+out/
+coverage/
+.cache/
+.sass-cache/
+tmp/
+
+# Environment files
+.env
+.env.*
+
+# Deployment / tooling dirs
+.vercel/
+
+# Editors
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+
