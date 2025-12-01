@@ -22,6 +22,22 @@ import { persistJobSnapshot } from '@/lib/job-store'
  */
 const DEFAULT_JOB_DURATION_MS = 2 * 60 * 1000
 const RECENT_DURATION_SAMPLE_LIMIT = 20
+/**
+ * 允许任务持续处理的最短时间阈值（3 分钟），避免误判短任务。
+ */
+const MIN_STALLED_JOB_TIMEOUT_MS = 3 * 60 * 1000
+/**
+ * 超时时间 = 最近平均耗时 * 该系数。
+ */
+const STALLED_JOB_TIMEOUT_FACTOR = 4
+/**
+ * 连续多少次卡死后打开熔断。
+ */
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 2
+/**
+ * 熔断维持的最短冷却时间。
+ */
+const CIRCUIT_BREAKER_COOLDOWN_MS = 60 * 1000
 
 /**
  * 任务状态枚举。
@@ -75,6 +91,9 @@ interface QueueState {
   currentlyProcessingJob: string | null
   recentDurations: number[]
   averageDurationMs: number
+  consecutiveStalledJobs: number
+  circuitBreakerOpenedAt: number | null
+  workerGeneration: number
 }
 
 const globalQueueStateKey = Symbol.for('__videoJobQueue')
@@ -89,10 +108,141 @@ const queueState: QueueState =
     currentlyProcessingJob: null,
     recentDurations: [],
     averageDurationMs: DEFAULT_JOB_DURATION_MS,
+    consecutiveStalledJobs: 0,
+    circuitBreakerOpenedAt: null,
+    workerGeneration: 0,
   } satisfies QueueState)
 
 const jobStore = queueState.jobStore
 const pendingQueue = queueState.pendingQueue
+
+/**
+ * 保存当前正在运行的队列 worker，以便重复利用并在需要时向
+ * Vercel waitUntil 通知“还有后台任务需要完成”。
+ */
+let activeWorkerPromise: Promise<void> | null = null
+
+/**
+ * 递增 worker 代际编号，用于令旧 worker 察觉自己已失效。
+ */
+function bumpWorkerGeneration(): number {
+  queueState.workerGeneration += 1
+  return queueState.workerGeneration
+}
+
+/**
+ * 判断指定 worker 是否仍与最新代际保持一致。
+ */
+function isWorkerGenerationCurrent(workerGeneration: number): boolean {
+  return workerGeneration === queueState.workerGeneration
+}
+
+/**
+ * 按照历史耗时推算卡死检测阈值。
+ */
+function computeStalledJobTimeoutMs(): number {
+  const dynamicTimeout = queueState.averageDurationMs * STALLED_JOB_TIMEOUT_FACTOR
+  return Math.max(Math.round(dynamicTimeout), MIN_STALLED_JOB_TIMEOUT_MS)
+}
+
+/**
+ * 在任务顺利完成后重置熔断状态。
+ */
+function resetCircuitBreaker(): void {
+  queueState.consecutiveStalledJobs = 0
+  queueState.circuitBreakerOpenedAt = null
+}
+
+/**
+ * 打开熔断，使后续请求在冷却前不再唤醒 worker。
+ */
+function openCircuitBreaker(reason: string): void {
+  queueState.circuitBreakerOpenedAt = Date.now()
+  console.error(`[JobQueue] 触发熔断: ${reason}`)
+}
+
+/**
+ * 返回熔断剩余的冷却时间（毫秒）。
+ */
+function getCircuitBreakerRemainingMs(): number {
+  if (!queueState.circuitBreakerOpenedAt) {
+    return 0
+  }
+  const elapsed = Date.now() - queueState.circuitBreakerOpenedAt
+  return Math.max(CIRCUIT_BREAKER_COOLDOWN_MS - elapsed, 0)
+}
+
+/**
+ * 判断熔断是否仍生效；冷却结束时会自动复位。
+ */
+function isCircuitBreakerOpen(): boolean {
+  if (!queueState.circuitBreakerOpenedAt) {
+    return false
+  }
+  if (Date.now() - queueState.circuitBreakerOpenedAt >= CIRCUIT_BREAKER_COOLDOWN_MS) {
+    resetCircuitBreaker()
+    return false
+  }
+  return true
+}
+
+/**
+ * 将当前 worker 标记为失效，避免其在恢复后继续处理任务。
+ */
+function invalidateActiveWorker(reason: string): void {
+  bumpWorkerGeneration()
+  queueState.queueWorkerActive = false
+  queueState.currentlyProcessingJob = null
+  activeWorkerPromise = null
+  console.warn(`[JobQueue] Worker 已失效: ${reason}`)
+}
+
+/**
+ * 若发现任务卡死，则标记为失败并触发必要的熔断逻辑。
+ */
+async function failStalledJobIfNeeded(): Promise<boolean> {
+  const stalledJobId = queueState.currentlyProcessingJob
+  if (!stalledJobId) {
+    return false
+  }
+
+  const job = jobStore.get(stalledJobId)
+  if (!job || job.status !== 'processing' || job.startedAt === null) {
+    return false
+  }
+
+  const timeoutMs = computeStalledJobTimeoutMs()
+  const elapsedMs = Date.now() - job.startedAt
+  if (elapsedMs < timeoutMs) {
+    return false
+  }
+
+  const timeoutSeconds = Math.round(timeoutMs / 1000)
+  const timeoutMessage = `任务执行超过 ${timeoutSeconds} 秒，系统自动终止以避免阻塞`
+  job.status = 'failed'
+  job.error = timeoutMessage
+  job.message = '任务执行超时，系统已自动终止'
+  job.progress = Math.min(job.progress, 99)
+  job.updatedAt = Date.now()
+  job.finishedAt = job.updatedAt
+  persistSnapshot(job)
+  recordJobDuration(job)
+
+  await cleanupPayloadFiles(job.payload)
+
+  queueState.currentlyProcessingJob = null
+  queueState.consecutiveStalledJobs += 1
+
+  console.warn(`[JobQueue] ${timeoutMessage}`, { jobId: job.id, elapsedMs })
+
+  invalidateActiveWorker('卡死任务触发熔断')
+
+  if (queueState.consecutiveStalledJobs >= CIRCUIT_BREAKER_FAILURE_THRESHOLD) {
+    openCircuitBreaker(`连续 ${queueState.consecutiveStalledJobs} 个任务卡死`)
+  }
+
+  return true
+}
 
 /**
  * 将当前记录同步到持久化存储（忽略失败）。
@@ -192,15 +342,15 @@ function computeLiveQueuePosition(record: InternalJobRecord): number {
   return jobsAheadInQueue + processingPenalty
 }
 
-async function startQueueWorkerIfNeeded(): Promise<void> {
-  if (queueState.queueWorkerActive) {
-    return
-  }
-
+async function runQueueWorker(workerGeneration: number): Promise<void> {
   queueState.queueWorkerActive = true
 
   try {
     while (pendingQueue.length > 0) {
+      if (!isWorkerGenerationCurrent(workerGeneration)) {
+        break
+      }
+
       const nextJobId = pendingQueue.shift()
       if (!nextJobId) {
         continue
@@ -230,28 +380,88 @@ async function startQueueWorkerIfNeeded(): Promise<void> {
           },
         })
 
+        if (!isWorkerGenerationCurrent(workerGeneration) || job.status !== 'processing') {
+          break
+        }
+
         job.status = 'completed'
         job.progress = 100
         job.result = { videos: result.videos }
         job.message = result.message
         persistSnapshot(job)
       } catch (error) {
+        if (!isWorkerGenerationCurrent(workerGeneration) || job.status !== 'processing') {
+          break
+        }
+
         job.status = 'failed'
         job.error = error instanceof Error ? error.message : String(error)
         job.message = '视频处理失败'
         persistSnapshot(job)
       } finally {
-        job.updatedAt = Date.now()
-        job.finishedAt = Date.now()
-        recordJobDuration(job)
+        const jobAlreadyFinalized = job.finishedAt !== null
+
+        if (!jobAlreadyFinalized) {
+          job.updatedAt = Date.now()
+          job.finishedAt = Date.now()
+          recordJobDuration(job)
+        }
+
         queueState.currentlyProcessingJob = null
         await cleanupPayloadFiles(job.payload)
+
+        if (!jobAlreadyFinalized) {
+          resetCircuitBreaker()
+        }
       }
     }
   } finally {
-    queueState.queueWorkerActive = false
-    queueState.currentlyProcessingJob = null
+    if (isWorkerGenerationCurrent(workerGeneration)) {
+      queueState.queueWorkerActive = false
+      queueState.currentlyProcessingJob = null
+    }
   }
+}
+
+function startQueueWorkerIfNeeded(): Promise<void> | undefined {
+  if (pendingQueue.length === 0 && queueState.queueWorkerActive === false) {
+    return activeWorkerPromise ?? undefined
+  }
+
+  if (activeWorkerPromise) {
+    return activeWorkerPromise
+  }
+
+  const workerGeneration = bumpWorkerGeneration()
+  const workerPromise = runQueueWorker(workerGeneration)
+
+  activeWorkerPromise = workerPromise
+
+  workerPromise.finally(() => {
+    if (activeWorkerPromise === workerPromise) {
+      activeWorkerPromise = null
+    }
+  })
+
+  return workerPromise
+}
+
+/**
+ * 供 API 层调用：在唤醒 worker 前执行超时检测与熔断判定。
+ */
+export async function ensureQueueWorkerRunning(): Promise<void> {
+  const stalledJobCleared = await failStalledJobIfNeeded()
+  if (stalledJobCleared) {
+    console.warn('[JobQueue] 检测到卡死任务，已自动标记失败并重置队列。')
+  }
+
+  if (isCircuitBreakerOpen()) {
+    const remaining = getCircuitBreakerRemainingMs()
+    console.warn(`[JobQueue] 熔断生效，${remaining}ms 内不再重启 worker。`)
+    return
+  }
+
+  return startQueueWorkerIfNeeded() ?? Promise.resolve()
 }
 
 async function cleanupPayloadFiles(payload: VideoProcessorPayload): Promise<void> {

@@ -7,6 +7,7 @@
  * 3. 下载完成后构造后台渲染任务，推入队列并立即返回 jobId。
  */
 
+import { waitUntil } from '@vercel/functions'
 import { NextRequest, NextResponse } from 'next/server'
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
@@ -16,7 +17,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 
-import { enqueueJob, getOwnerActiveJobCount } from '@/lib/job-queue'
+import { enqueueJob, ensureQueueWorkerRunning, getOwnerActiveJobCount } from '@/lib/job-queue'
 import {
   readTemplateMetadata,
   type TemplateDescriptor,
@@ -290,6 +291,7 @@ export async function handleProcessPost(req: NextRequest) {
     }
 
     const jobSnapshot = enqueueJob(jobPayload, { ownerId: clientIdentity.ownerId })
+    waitUntil(ensureQueueWorkerRunning())
     const ownerActiveJobs = getOwnerActiveJobCount(clientIdentity.ownerId)
 
     return NextResponse.json({
