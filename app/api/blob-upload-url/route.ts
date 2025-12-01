@@ -8,18 +8,20 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@vercel/blob'
+import { generateClientTokenFromReadWriteToken } from '@vercel/blob/client'
 
 export const runtime = 'nodejs'
 
 const MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024 // 2GB，受 Blob 与 /tmp 限制
+const TOKEN_TTL_MS = 15 * 60 * 1000 // 上传凭证默认 15 分钟失效
+const LOCAL_UPLOAD_ENDPOINT = '/api/local-upload'
 
-const blobToken = process.env.VERCEL_BLOB_READ_WRITE_TOKEN
-const blobClient = blobToken
-  ? createClient({
-      token: blobToken,
-    })
-  : null
+const blobToken =
+  process.env.VERCEL_BLOB_READ_WRITE_TOKEN ?? process.env.BLOB_READ_WRITE_TOKEN ?? process.env.NEXT_PUBLIC_BLOB_READ_WRITE_TOKEN ?? null
+
+const allowLocalFallback =
+  process.env.ALLOW_LOCAL_FILE_UPLOAD === 'true' ||
+  (process.env.NODE_ENV !== 'production' && process.env.ALLOW_LOCAL_FILE_UPLOAD !== 'false')
 
 interface UploadUrlRequestBody {
   filename: string
@@ -27,12 +29,7 @@ interface UploadUrlRequestBody {
   fileSize: number
 }
 
-/**
- * 校验上传参数并返回标准化结果。
- *
- * @param body - 前端传入的原始 JSON
- * @returns 清洗后的文件描述
- */
+/** 校验上传参数并返回标准化结果。 */
 function validateRequestBody(body: UploadUrlRequestBody): UploadUrlRequestBody {
   if (!body || typeof body.filename !== 'string' || body.filename.trim().length === 0) {
     throw new Error('filename 字段必填')
@@ -54,39 +51,73 @@ function validateRequestBody(body: UploadUrlRequestBody): UploadUrlRequestBody {
   }
 }
 
+/** 将用户提供的文件名归一化，并生成避免冲突的路径。 */
+function buildBlobPath(filename: string): string {
+  const normalized = filename
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9._-]/g, '')
+    .trim()
+
+  const effectiveName = normalized.length > 0 ? normalized : `file-${Date.now()}`
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '')
+  const randomSuffix = Math.random().toString(36).slice(2, 10)
+  return `uploads/${timestamp}-${randomSuffix}-${effectiveName}`
+}
+
 /**
- * POST /api/blob-upload-url
- *
- * 负责生成一次性、短时有效的 PUT 链接，供浏览器直传 Blob。
+ * 生成带约束的 Blob 客户端上传凭证，供前端使用 `@vercel/blob/client` 直传。
  */
 export async function POST(req: NextRequest) {
-  if (!blobClient) {
-    return NextResponse.json(
-      {
-        error: '尚未配置 VERCEL_BLOB_READ_WRITE_TOKEN，无法生成上传地址',
-      },
-      { status: 500 },
-    )
-  }
-
   try {
     const body = (await req.json()) as UploadUrlRequestBody
     const { filename, contentType, fileSize } = validateRequestBody(body)
+    const pathname = buildBlobPath(filename)
+    const validUntil = Date.now() + TOKEN_TTL_MS
 
-    const uploadTarget = await blobClient.generateUploadURL({
-      access: 'public',
-      contentType,
-      tokenPayload: {
-        filename,
-        fileSize,
-      },
+    if (!blobToken) {
+      if (!allowLocalFallback) {
+        return NextResponse.json(
+          {
+            error: '尚未配置 VERCEL_BLOB_READ_WRITE_TOKEN，无法生成上传凭证',
+          },
+          { status: 500 },
+        )
+      }
+
+      console.warn(
+        '[blob-upload-url] 检测到缺少 Vercel Blob 凭证，已自动降级为本地上传模式（仅用于开发环境）。',
+      )
+
+      return NextResponse.json({
+        strategy: 'local',
+        uploadEndpoint: LOCAL_UPLOAD_ENDPOINT,
+        expiresAt: new Date(validUntil).toISOString(),
+        maxUploadBytes: MAX_UPLOAD_SIZE_BYTES,
+        originalFilename: filename,
+        declaredSize: fileSize,
+      })
+    }
+
+    const clientToken = await generateClientTokenFromReadWriteToken({
+      token: blobToken,
+      pathname,
+      maximumSizeInBytes: MAX_UPLOAD_SIZE_BYTES,
+      allowedContentTypes: [contentType],
+      addRandomSuffix: false,
+      allowOverwrite: false,
+      validUntil,
+      cacheControlMaxAge: 60 * 60 * 24 * 30, // 30 天 CDN 缓存
     })
 
     return NextResponse.json({
-      uploadUrl: uploadTarget.url,
-      blobId: uploadTarget.id,
-      publicUrl: `https://blob.vercel-storage.com${uploadTarget.pathname}`,
-      expiresAt: uploadTarget.expiresAt,
+      strategy: 'vercel',
+      clientToken,
+      pathname,
+      expiresAt: new Date(validUntil).toISOString(),
+      maxUploadBytes: MAX_UPLOAD_SIZE_BYTES,
+      originalFilename: filename,
+      declaredSize: fileSize,
     })
   } catch (error) {
     console.error('Failed to generate blob upload URL:', error)

@@ -154,6 +154,27 @@ FFmpeg 滤镜链：
 -shortest        // 以最短的输入流为准
 ```
 
+### 指定 FFmpeg 路径
+
+应用会按以下优先级寻找可执行文件：
+
+1. `.env.local` 中的 `LOCAL_FFMPEG_PATH` 或 `FFMPEG_PATH`
+2. `ffmpeg-static` 依赖随包提供的二进制
+3. 系统 PATH 中的 `ffmpeg`（同时会尝试 `/opt/homebrew/bin/ffmpeg`、`/usr/local/bin/ffmpeg` 等常见路径）
+
+若本地没有安装 `ffmpeg-static`，可以：
+
+```bash
+# 方案 A：直接安装静态依赖
+pnpm add ffmpeg-static
+
+# 方案 B：使用系统 FFmpeg，并在 .env.local 中声明路径
+brew install ffmpeg                # macOS 示例
+echo "LOCAL_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg" >> .env.local
+```
+
+修改完环境变量后需要重新启动 `pnpm dev` 才能生效。
+
 ### 性能优化建议
 
 1. **Preset 选项**：

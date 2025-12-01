@@ -219,6 +219,31 @@ Command + Option + C
 - 某些 console API 可能显示略有差异
 - 功能上完全等效
 
+### 问题 5: 上传接口返回 500，提示缺少 `VERCEL_BLOB_READ_WRITE_TOKEN`
+
+**现象:**
+- 网络面板中的 `/api/blob-upload-url` 请求为 500。
+- 控制台出现 `"无法生成 VERCEL_BLOB_READ_WRITE_TOKEN"`、`Failed to load resource: 500` 等报错。
+
+**原因:**
+- 该接口会向 Vercel Blob 请求一次性上传凭证；若环境变量中没有可写令牌，就无法生成 URL。
+
+**解决方式:**
+1. **首选：提供真实令牌**
+   - 在 Vercel 仪表盘 → Storage → Blob 中创建 **Read & Write Token**。
+   - 在 `.env.local` 中新增：
+     ```
+     VERCEL_BLOB_READ_WRITE_TOKEN=xxxxx
+     ```
+   - 重新启动 `pnpm dev` 并刷新页面。
+2. **备选：启用本地兜底上传（开发模式默认开启）**
+   - 当未设置令牌且当前不在生产环境时，后端会自动改用 `/api/local-upload`。
+   - 文件会被写入 `public/local-uploads/`，页面可直接以 `http://localhost:3000/local-uploads/...` 形式访问。
+   - 通过设置 `ALLOW_LOCAL_FILE_UPLOAD=false` 可以强制关闭该兜底模式。
+3. **安全提示**
+   - `public/local-uploads/` 已在 `.gitignore` 中，防止大文件被提交。
+   - 若切换回 Vercel Blob，请清空该目录以释放磁盘空间。
+
 ---
 
 ## Safari 开发者工具快捷键速查

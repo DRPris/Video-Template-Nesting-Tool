@@ -4,6 +4,7 @@
  * 视频格式转换首页：负责上传源视频、选择模板、触发渲染并展示下载入口。
  */
 
+import { put } from "@vercel/blob/client"
 import { useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -23,11 +24,33 @@ interface ParsedErrorResponse {
   payload: unknown
 }
 
-interface BlobUploadUrlResponse {
-  uploadUrl: string
-  blobId: string
-  publicUrl: string
-  expiresAt?: string
+interface BaseUploadTokenResponse {
+  strategy: "vercel" | "local"
+  expiresAt: string
+  maxUploadBytes: number
+  originalFilename: string
+  declaredSize: number
+}
+
+interface VercelBlobUploadTokenResponse extends BaseUploadTokenResponse {
+  strategy: "vercel"
+  clientToken: string
+  pathname: string
+}
+
+interface LocalUploadTokenResponse extends BaseUploadTokenResponse {
+  strategy: "local"
+  uploadEndpoint: string
+}
+
+type BlobUploadTokenResponse = VercelBlobUploadTokenResponse | LocalUploadTokenResponse
+
+interface LocalUploadResponsePayload {
+  url: string
+  pathname: string
+  originalName: string
+  size: number
+  mimeType: string
 }
 
 interface RemoteFileReferencePayload {
@@ -156,9 +179,9 @@ function formatBytesForDisplay(bytes: number): string {
 }
 
 /**
- * 请求后端生成一次性 Blob 上传 URL。
+ * 请求服务端生成一次性 Blob 客户端上传凭证。
  */
-async function requestBlobUploadUrl(file: File): Promise<BlobUploadUrlResponse> {
+async function requestBlobUploadToken(file: File): Promise<BlobUploadTokenResponse> {
   const response = await fetch("/api/blob-upload-url", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -174,60 +197,81 @@ async function requestBlobUploadUrl(file: File): Promise<BlobUploadUrlResponse> 
     throw new Error(message)
   }
 
-  return (await response.json()) as BlobUploadUrlResponse
+  return (await response.json()) as BlobUploadTokenResponse
 }
 
 /**
- * 使用 XMLHttpRequest 上传文件，以便追踪进度事件。
+ * 使用 Vercel Blob 直传策略上传文件。
  */
-function uploadBinaryWithProgress(uploadUrl: string, file: File, onProgress?: (ratio: number) => void): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest()
-    xhr.open("PUT", uploadUrl)
-    if (file.type) {
-      xhr.setRequestHeader("Content-Type", file.type)
-    }
-
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && onProgress) {
-        onProgress(event.loaded / event.total)
-      }
-    }
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve()
-      } else {
-        reject(new Error(`上传失败（状态码 ${xhr.status}）`))
-      }
-    }
-
-    xhr.onerror = () => reject(new Error("网络异常导致上传失败"))
-    xhr.send(file)
-  })
-}
-
-/**
- * 将单个文件上传到 Blob 并返回可供后端使用的引用。
- */
-async function persistFileViaBlob(
+async function uploadFileViaVercelBlob(
   file: File,
-  label: string,
-  onProgress?: (ratio: number) => void,
+  uploadToken: VercelBlobUploadTokenResponse,
 ): Promise<RemoteFileReferencePayload> {
-  if (file.size > MAX_SINGLE_UPLOAD_BYTES) {
-    throw new Error(`${label} 超过当前 ${formatBytesForDisplay(MAX_SINGLE_UPLOAD_BYTES)} 的单文件限制`)
-  }
-
-  const uploadTarget = await requestBlobUploadUrl(file)
-  await uploadBinaryWithProgress(uploadTarget.uploadUrl, file, onProgress)
+  const uploadResult = await put(uploadToken.pathname, file, {
+    access: "public",
+    token: uploadToken.clientToken,
+    contentType: file.type || "application/octet-stream",
+  })
 
   return {
-    url: uploadTarget.publicUrl,
+    url: uploadResult.url,
     originalName: file.name,
     size: file.size,
     mimeType: file.type || "application/octet-stream",
   }
+}
+
+/**
+ * 使用后端本地兜底接口上传文件，仅在开发环境触发。
+ */
+async function uploadFileViaLocalEndpoint(
+  file: File,
+  label: string,
+  uploadToken: LocalUploadTokenResponse,
+): Promise<RemoteFileReferencePayload> {
+  const formData = new FormData()
+  formData.append("file", file, file.name)
+  formData.append("label", label)
+  formData.append("mimeType", file.type || "application/octet-stream")
+  formData.append("size", `${file.size}`)
+
+  const response = await fetch(uploadToken.uploadEndpoint, {
+    method: "POST",
+    body: formData,
+  })
+
+  if (!response.ok) {
+    const { message } = await parseErrorResponse(response)
+    throw new Error(message)
+  }
+
+  const payload = (await response.json()) as LocalUploadResponsePayload
+  return {
+    url: payload.url,
+    originalName: payload.originalName,
+    size: payload.size,
+    mimeType: payload.mimeType,
+  }
+}
+
+/**
+ * 根据运行环境自动选择上传策略，并返回后端需要的远程引用。
+ */
+async function persistFileWithAdaptiveStrategy(file: File, label: string): Promise<RemoteFileReferencePayload> {
+  if (file.size > MAX_SINGLE_UPLOAD_BYTES) {
+    throw new Error(`${label} 超过当前 ${formatBytesForDisplay(MAX_SINGLE_UPLOAD_BYTES)} 的单文件限制`)
+  }
+
+  const uploadToken = await requestBlobUploadToken(file)
+  if (file.size > uploadToken.maxUploadBytes) {
+    throw new Error(`${label} 超过后端允许的 ${formatBytesForDisplay(uploadToken.maxUploadBytes)} 限制`)
+  }
+
+  if (uploadToken.strategy === "local") {
+    return uploadFileViaLocalEndpoint(file, label, uploadToken)
+  }
+
+  return uploadFileViaVercelBlob(file, uploadToken)
 }
 
 export default function Home() {
@@ -402,7 +446,7 @@ export default function Home() {
 
       const uploadedVideos: RemoteFileReferencePayload[] = []
       for (const [index, video] of videos.entries()) {
-        const uploaded = await persistFileViaBlob(video, `竖版视频 #${index + 1}`)
+        const uploaded = await persistFileWithAdaptiveStrategy(video, `竖版视频 #${index + 1}`)
         uploadedVideos.push(uploaded)
       }
 
@@ -413,13 +457,13 @@ export default function Home() {
       } = {}
 
       if (templates.vertical) {
-        uploadedTemplates.vertical = await persistFileViaBlob(templates.vertical, "竖版模板")
+        uploadedTemplates.vertical = await persistFileWithAdaptiveStrategy(templates.vertical, "竖版模板")
       }
       if (templates.square) {
-        uploadedTemplates.square = await persistFileViaBlob(templates.square, "方版模板")
+        uploadedTemplates.square = await persistFileWithAdaptiveStrategy(templates.square, "方版模板")
       }
       if (templates.horizontal) {
-        uploadedTemplates.landscape = await persistFileViaBlob(templates.horizontal, "横版模板")
+        uploadedTemplates.landscape = await persistFileWithAdaptiveStrategy(templates.horizontal, "横版模板")
       }
 
       const requestPayload: ProcessRequestBody = {

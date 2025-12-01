@@ -29,6 +29,10 @@ const rawOwnerLimit = Number(process.env.MAX_ACTIVE_JOBS_PER_OWNER ?? 2)
 const MAX_ACTIVE_JOBS_PER_OWNER = Number.isFinite(rawOwnerLimit) && rawOwnerLimit >= 1 ? rawOwnerLimit : 2
 const MAX_REMOTE_FILE_BYTES = 2 * 1024 * 1024 * 1024 // 2GB，只受限于 /tmp 和 ffmpeg
 const SUPPORTED_PROTOCOLS = new Set(['https:'])
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
+const allowInsecureHttpSources =
+  process.env.ALLOW_INSECURE_HTTP_SOURCES === 'true' ||
+  (process.env.NODE_ENV !== 'production' && process.env.ALLOW_INSECURE_HTTP_SOURCES !== 'false')
 
 interface RemoteAssetPayload {
   url: string
@@ -152,8 +156,14 @@ async function persistRemoteAsset(
     throw new Error(`${label} 提供的 URL 无法解析，请确认它是有效的 HTTPS 地址`)
   }
 
-  if (!SUPPORTED_PROTOCOLS.has(parsedUrl.protocol)) {
-    throw new Error(`${label} 仅支持 HTTPS 资源，当前协议: ${parsedUrl.protocol}`)
+  const isHttps = SUPPORTED_PROTOCOLS.has(parsedUrl.protocol)
+  const isLoopbackHttp = allowInsecureHttpSources && parsedUrl.protocol === 'http:' && LOOPBACK_HOSTS.has(parsedUrl.hostname)
+
+  if (!isHttps && !isLoopbackHttp) {
+    const hint = allowInsecureHttpSources
+      ? '请使用 localhost / 127.0.0.1 或改用 HTTPS 链接'
+      : '若在本地调试，可设置 ALLOW_INSECURE_HTTP_SOURCES=true'
+    throw new Error(`${label} 仅支持 HTTPS 资源，当前协议: ${parsedUrl.protocol}。${hint}`)
   }
 
   console.log(`⬇️ 正在下载 ${label}: ${normalizedName} (${formatBytes(normalizedSize)})`)

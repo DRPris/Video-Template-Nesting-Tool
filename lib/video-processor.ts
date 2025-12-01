@@ -12,6 +12,7 @@
 
 import fs from 'fs'
 import path from 'path'
+import { spawnSync } from 'child_process'
 import ffmpeg from 'fluent-ffmpeg'
 import ffmpegStatic from 'ffmpeg-static'
 
@@ -88,30 +89,95 @@ export interface ProcessVideoOptions {
 
 const OUTPUT_DIRECTORY = '/tmp'
 
+const explicitFfmpegPath =
+  process.env.LOCAL_FFMPEG_PATH ??
+  process.env.FFMPEG_PATH ??
+  process.env.NEXT_PUBLIC_FFMPEG_PATH ??
+  null
+
 let ffmpegConfigured = false
 
+type FfmpegBinarySource = 'custom-env' | 'bundled-static' | 'system-detect'
+
 /**
- * 确保 FFmpeg 仅初始化一次：在无系统依赖的 Serverless 环境中，
- * 强制使用随包发布的 ffmpeg-static 二进制文件。
+ * 根据优先级解析一个可用的 FFmpeg 可执行文件路径。
+ */
+function resolveCandidatePath(candidate: string | null): string | null {
+  if (!candidate || candidate.trim().length === 0) {
+    return null
+  }
+
+  const normalized = candidate.trim()
+  const absolutePath = path.isAbsolute(normalized) ? normalized : path.resolve(process.cwd(), normalized)
+  return fs.existsSync(absolutePath) ? absolutePath : null
+}
+
+/**
+ * 通过系统命令自动探测 FFmpeg 路径。
+ */
+function detectSystemFfmpeg(): string | null {
+  const locator = process.platform === 'win32' ? 'where' : 'which'
+  const probe = spawnSync(locator, ['ffmpeg'], { encoding: 'utf8' })
+  const dynamicCandidates =
+    probe.status === 0
+      ? probe.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+      : []
+
+  const fallbackCommonPaths = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']
+
+  for (const candidate of [...dynamicCandidates, ...fallbackCommonPaths]) {
+    const resolved = resolveCandidatePath(candidate)
+    if (resolved) {
+      return resolved
+    }
+  }
+
+  return null
+}
+
+function resolveFfmpegBinary(): { path: string; source: FfmpegBinarySource } {
+  const envPath = resolveCandidatePath(explicitFfmpegPath)
+  if (envPath) {
+    return { path: envPath, source: 'custom-env' }
+  }
+
+  const bundledPath = resolveCandidatePath(typeof ffmpegStatic === 'string' ? ffmpegStatic : null)
+  if (bundledPath) {
+    return { path: bundledPath, source: 'bundled-static' }
+  }
+
+  const systemPath = detectSystemFfmpeg()
+  if (systemPath) {
+    return { path: systemPath, source: 'system-detect' }
+  }
+
+  throw new Error(
+    [
+      '未能自动找到 FFmpeg 可执行文件，请确认已安装 ffmpeg-static 或本地 FFmpeg。',
+      '可选操作：',
+      '1. 运行 `pnpm add ffmpeg-static` 以恢复随包二进制；或',
+      '2. 安装系统 FFmpeg（macOS: `brew install ffmpeg`）；或',
+      '3. 在 .env.local 中设置 LOCAL_FFMPEG_PATH 指向手动安装的 ffmpeg。',
+    ].join('\n'),
+  )
+}
+
+/**
+ * 确保 FFmpeg 仅初始化一次：优先使用自定义路径，其次为随包静态二进制，最后回退到系统命令。
  */
 function ensureFfmpegIsReady(): void {
   if (ffmpegConfigured) return
 
-  if (!ffmpegStatic || typeof ffmpegStatic !== 'string') {
-    throw new Error(
-      '未能从 ffmpeg-static 解析到可执行文件，请确认依赖已安装且未被 tree-shaking 移除。',
-    )
-  }
+  const { path: resolvedPath, source } = resolveFfmpegBinary()
 
-  if (!fs.existsSync(ffmpegStatic)) {
-    throw new Error(
-      `在路径 ${ffmpegStatic} 未找到 ffmpeg，可尝试重新安装依赖：pnpm add ffmpeg-static`,
-    )
-  }
-
-  ffmpeg.setFfmpegPath(ffmpegStatic)
+  ffmpeg.setFfmpegPath(resolvedPath)
   ffmpegConfigured = true
-  console.log('🎬 FFmpeg 路径已锁定为静态依赖:', ffmpegStatic)
+  const sourceLabel =
+    source === 'custom-env' ? '自定义路径' : source === 'bundled-static' ? 'ffmpeg-static' : '系统 PATH'
+  console.log(`🎬 FFmpeg 路径已锁定 (${sourceLabel}):`, resolvedPath)
 }
 
 ensureFfmpegIsReady()
