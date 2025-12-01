@@ -180,8 +180,6 @@ function ensureFfmpegIsReady(): void {
   console.log(`🎬 FFmpeg 路径已锁定 (${sourceLabel}):`, resolvedPath)
 }
 
-ensureFfmpegIsReady()
-
 /**
  * 使用 ffprobe 读取模板文件的核心元数据，并判断是否包含 Alpha 通道。
  *
@@ -190,6 +188,7 @@ ensureFfmpegIsReady()
  * @returns 模板的分辨率、像素格式和 Alpha 通道信息
  */
 export async function readTemplateMetadata(label: string, filePath: string): Promise<TemplateMetadata> {
+  ensureFfmpegIsReady()
   return await new Promise<TemplateMetadata>((resolve) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
       if (err || !metadata) {
@@ -418,6 +417,7 @@ export async function processVideoBatch(
   payload: VideoProcessorPayload,
   options: ProcessVideoOptions = {},
 ): Promise<{ success: boolean; message: string; videos: GeneratedVideoResult[] }> {
+  ensureFfmpegIsReady()
   const { onProgress } = options
   const verticalTemplate = payload.templates.vertical
   const squareTemplate = payload.templates.square
