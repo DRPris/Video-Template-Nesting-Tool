@@ -13,6 +13,7 @@
 import fs from 'fs'
 import path from 'path'
 import { spawnSync } from 'child_process'
+import ffmpegInstaller from '@ffmpeg-installer/ffmpeg'
 import ffmpeg from 'fluent-ffmpeg'
 import ffmpegStatic from 'ffmpeg-static'
 
@@ -95,9 +96,11 @@ const explicitFfmpegPath =
   process.env.NEXT_PUBLIC_FFMPEG_PATH ??
   null
 
+const installerFfmpegPath = ffmpegInstaller?.path ?? null
+
 let ffmpegConfigured = false
 
-type FfmpegBinarySource = 'custom-env' | 'bundled-static' | 'system-detect'
+type FfmpegBinarySource = 'custom-env' | 'bundled-static' | 'installer-package' | 'system-detect'
 
 /**
  * 根据优先级解析一个可用的 FFmpeg 可执行文件路径。
@@ -149,6 +152,11 @@ function resolveFfmpegBinary(): { path: string; source: FfmpegBinarySource } {
     return { path: bundledPath, source: 'bundled-static' }
   }
 
+  const installerPath = resolveCandidatePath(installerFfmpegPath)
+  if (installerPath) {
+    return { path: installerPath, source: 'installer-package' }
+  }
+
   const systemPath = detectSystemFfmpeg()
   if (systemPath) {
     return { path: systemPath, source: 'system-detect' }
@@ -176,7 +184,13 @@ function ensureFfmpegIsReady(): void {
   ffmpeg.setFfmpegPath(resolvedPath)
   ffmpegConfigured = true
   const sourceLabel =
-    source === 'custom-env' ? '自定义路径' : source === 'bundled-static' ? 'ffmpeg-static' : '系统 PATH'
+    source === 'custom-env'
+      ? '自定义路径'
+      : source === 'bundled-static'
+        ? 'ffmpeg-static'
+        : source === 'installer-package'
+          ? '@ffmpeg-installer/ffmpeg'
+          : '系统 PATH'
   console.log(`🎬 FFmpeg 路径已锁定 (${sourceLabel}):`, resolvedPath)
 }
 
