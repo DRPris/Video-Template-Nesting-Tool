@@ -14,6 +14,7 @@ import {
   type VideoProcessorPayload,
   type GeneratedVideoResult,
 } from '@/lib/video-processor'
+import { persistJobSnapshot } from '@/lib/job-store'
 
 /**
  * 估算等待时间的默认回退（2 分钟），单位：毫秒。
@@ -94,6 +95,15 @@ const jobStore = queueState.jobStore
 const pendingQueue = queueState.pendingQueue
 
 /**
+ * 将当前记录同步到持久化存储（忽略失败）。
+ *
+ * @param record - 需要同步的任务记录
+ */
+function persistSnapshot(record: InternalJobRecord): void {
+  void persistJobSnapshot(toPublicSnapshot(record))
+}
+
+/**
  * 将视频处理请求入队，并立即返回任务 ID。
  *
  * @param payload - 上传的视频和模板信息
@@ -130,7 +140,9 @@ export function enqueueJob(payload: VideoProcessorPayload, options: EnqueueOptio
   pendingQueue.push(jobId)
   void startQueueWorkerIfNeeded()
 
-  return toPublicSnapshot(jobRecord)
+  const snapshot = toPublicSnapshot(jobRecord)
+  persistSnapshot(jobRecord)
+  return snapshot
 }
 
 /**
@@ -205,6 +217,7 @@ async function startQueueWorkerIfNeeded(): Promise<void> {
       job.updatedAt = Date.now()
       job.startedAt = Date.now()
       job.metrics.completedVariants = 0
+      persistSnapshot(job)
 
       try {
         const result = await processVideoBatch(job.payload, {
@@ -213,6 +226,7 @@ async function startQueueWorkerIfNeeded(): Promise<void> {
             job.metrics.totalVariants = total
             job.progress = Math.min(99, Math.round((completed / total) * 100))
             job.updatedAt = Date.now()
+            persistSnapshot(job)
           },
         })
 
@@ -220,10 +234,12 @@ async function startQueueWorkerIfNeeded(): Promise<void> {
         job.progress = 100
         job.result = { videos: result.videos }
         job.message = result.message
+        persistSnapshot(job)
       } catch (error) {
         job.status = 'failed'
         job.error = error instanceof Error ? error.message : String(error)
         job.message = '视频处理失败'
+        persistSnapshot(job)
       } finally {
         job.updatedAt = Date.now()
         job.finishedAt = Date.now()

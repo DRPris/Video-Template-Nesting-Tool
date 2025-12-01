@@ -10,6 +10,7 @@ export const runtime = 'nodejs'
 import { NextRequest, NextResponse } from 'next/server'
 
 import { getJobSnapshot } from '@/lib/job-queue'
+import { readJobSnapshotFromStore } from '@/lib/job-store'
 
 interface JobStatusParams {
   jobId: string
@@ -20,7 +21,7 @@ interface JobStatusParams {
  */
 export async function GET(_req: NextRequest, context: { params: Promise<JobStatusParams> }) {
   const { jobId } = await context.params
-  const job = getJobSnapshot(jobId)
+  const job = getJobSnapshot(jobId) ?? (await readJobSnapshotFromStore(jobId))
 
   if (!job) {
     return NextResponse.json({ error: '任务不存在或已过期' }, { status: 404 })
