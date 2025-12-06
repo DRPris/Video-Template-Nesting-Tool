@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef } from 'react'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { toBlobURL } from '@ffmpeg/util'
 
@@ -6,14 +6,19 @@ export function useFFmpeg() {
   const [loaded, setLoaded] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [message, setMessage] = useState('')
-  const ffmpegRef = useRef(new FFmpeg())
+  const ffmpegRef = useRef<FFmpeg | null>(null)
 
   const load = async () => {
     if (loaded) return
     setIsLoading(true)
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+
+    if (!ffmpegRef.current) {
+      ffmpegRef.current = new FFmpeg()
+    }
+
     const ffmpeg = ffmpegRef.current
-    
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+
     ffmpeg.on('log', ({ message }) => {
       console.log(message)
       setMessage(message)
@@ -35,7 +40,7 @@ export function useFFmpeg() {
   }
 
   return {
-    ffmpeg: ffmpegRef.current,
+    ffmpeg: ffmpegRef.current!, // Non-null assertion is safe after loaded is true, but we should handle it in UI
     loaded,
     isLoading,
     message,
